@@ -1,0 +1,194 @@
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader, Dataset
+from PIL import Image
+import numpy as np
+
+print("PyTorch version:", torch.__version__)
+print("GPU available:", torch.cuda.is_available())
+
+
+# CELL 2 — Trimap Dataset (both train and test)
+class PetWithTrimap(Dataset):
+    def __init__(self, split, transform=None):
+        self.base = datasets.OxfordIIITPet(
+            root='/content/data', split=split, download=True,
+            target_types=['category', 'segmentation']
+        )
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, idx):
+        image, (label, trimap) = self.base[idx]
+
+        image_np  = np.array(image).astype(np.float32)
+        trimap_np = np.array(trimap)
+
+        fg_mask     = (trimap_np != 2).astype(np.float32)
+        fg_mask_3ch = fg_mask[:, :, np.newaxis]
+        image_np    = image_np * fg_mask_3ch
+
+        image = Image.fromarray(image_np.astype(np.uint8))
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, label
+
+
+class CNN(nn.Module):
+    def __init__(self, num_classes=37):
+        super().__init__()
+        self.features = nn.Sequential(
+            # Block 1
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.MaxPool2d(2),      # 128 → 64
+
+            # Block 2
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(2),      # 64 → 32
+
+            # Block 3
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(2),      # 32 → 16
+
+            # Block 4
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.MaxPool2d(2),      # 16 → 8
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(256 * 8 * 8, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(512, num_classes),
+        )
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        return self.classifier(self.features(x))
+
+train_transform = transforms.Compose([
+    transforms.Resize((128, 128)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(15),
+    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3),
+    transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
+    transforms.RandomGrayscale(p=0.1),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225]),
+    transforms.RandomErasing(p=0.2, scale=(0.02, 0.2)),
+])
+test_transform = transforms.Compose([
+    transforms.Resize((128, 128)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225]),
+])
+
+train_dataset = PetWithTrimap(split='trainval', transform=train_transform)
+test_dataset  = PetWithTrimap(split='test',     transform=test_transform)
+
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True,  num_workers=2)
+test_loader  = DataLoader(test_dataset,  batch_size=32, shuffle=False, num_workers=2)
+print(f"Train: {len(train_dataset)}, Test: {len(test_dataset)}")
+
+
+# CELL 5 — Training 
+device    = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Training on: {device}")
+
+model     = CNN().to(device)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=3e-4)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=30, eta_min=1e-5)
+
+EPOCHS = 30
+
+for epoch in range(EPOCHS):
+    model.train()
+    running_loss = 0.0
+    correct      = 0
+    total        = 0
+
+    for images, labels in train_loader:
+        images, labels = images.to(device), labels.to(device)
+
+        optimizer.zero_grad()
+        outputs  = model(images)
+        loss     = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item()
+        _, predicted  = outputs.max(1)
+        correct      += predicted.eq(labels).sum().item()
+        total        += labels.size(0)
+
+    scheduler.step()
+
+    print(f"Epoch [{epoch+1:2d}/{EPOCHS}]  "
+          f"Loss: {running_loss/len(train_loader):.4f}  "
+          f"Train Acc: {100.*correct/total:.2f}%  "
+          f"LR: {scheduler.get_last_lr()[0]:.6f}")
+
+  # Save & download
+torch.save(model.state_dict(), '/content/model.pth')
+print("Saved to /content/model.pth")
+from google.colab import files
+files.download('/content/model.pth')
+
+#  Evaluate
+model.eval()    
+
+correct = total = 0
+with torch.no_grad():
+    for images, labels in train_loader:
+        images, labels = images.to(device), labels.to(device)
+        _, pred = model(images).max(1)
+        correct += pred.eq(labels).sum().item()
+        total   += labels.size(0)
+print(f"Final Train Accuracy: {100.*correct/total:.2f}%")
+
+correct = total = 0
+with torch.no_grad():
+    for images, labels in test_loader:
+        images, labels = images.to(device), labels.to(device)
+        _, pred = model(images).max(1)
+        correct += pred.eq(labels).sum().item()
+        total   += labels.size(0)
+print(f"Final Test Accuracy:  {100.*correct/total:.2f}%")
